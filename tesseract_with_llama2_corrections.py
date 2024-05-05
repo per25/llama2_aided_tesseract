@@ -98,8 +98,7 @@ def cosine_similarity(vec1, vec2):
     return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
 
 def filter_hallucinations(corrected_text, raw_text, threshold=0.1, pdf_file_path=None, db_path=None):
-    client = OpenAI(base_url="https://openrouter.ai/api/v1",
-                    api_key=getenv("OPENROUTER_API_KEY"))
+    client = OpenAI()
     threshold_increment = 0.02
     original_embeddings, corrected_embeddings = None, None
 
@@ -170,28 +169,25 @@ def filter_hallucinations(corrected_text, raw_text, threshold=0.1, pdf_file_path
 
     return filtered_corrected_text, original_embeddings, corrected_embeddings
 
-if __name__ == '__main__':
-    input_pdf_file_path = '160301289-Warren-Buffett-Katharine-Graham-Letter.pdf'
-    max_test_pages = 0 # set to 0 to convert all pages of the PDF file using Tesseract
-    skip_first_n_pages = 0 # set to 0 to process all pages with the LLM
-    starting_hallucination_similarity_threshold = 0.30 # The higher you set this, the more potential hallucinations will be filtered out (but also the more potential correct sentences will be filtered out)
-    check_if_valid_english = False # set to True to check if the extracted text is valid English
-    reformat_as_markdown = True # set to True to reformat the corrected extracted text using markdown formatting
-    sentence_embeddings_db_path = "./sentence_embeddings.sqlite"
-    test_filtering_hallucinations = False # set to True to test filtering hallucinations (for debugging purposes)
-
+def tesseract_with_llm_correction(input_pdf_file_path, 
+                                  max_test_pages=0,
+                                  skip_first_n_pages=0, 
+                                  starting_hallucination_similarity_threshold=0.30, 
+                                  check_if_valid_english=False, reformat_as_markdown=True, 
+                                  sentence_embeddings_db_path="./sentence_embeddings.sqlite", 
+                                  test_filtering_hallucinations=False):
+    
     if not test_filtering_hallucinations:
         list_of_scanned_images = convert_pdf_to_images_func(input_pdf_file_path, max_test_pages)
         print(f"Tesseract version: {pytesseract.get_tesseract_version()}")
         print("Extracting text from converted pages...")
+        
         with Pool() as p:
             list_of_extracted_text_strings = p.map(ocr_image, list_of_scanned_images)
         print("Done extracting text from converted pages. \n")
         raw_ocr_output = "\n".join(list_of_extracted_text_strings)
         base_name = os.path.splitext(input_pdf_file_path)[0]
-        raw_ocr_output_file_path = f"{base_name}__raw_ocr_output.txt"
-        with open(raw_ocr_output_file_path, "w") as f:
-            f.write(raw_ocr_output)
+
         # process the OCR output
         list_of_corrected_text_strings = []
         for ii, text in enumerate(list_of_extracted_text_strings):
@@ -201,23 +197,10 @@ if __name__ == '__main__':
             if extracted_text_string:
                 print(f"Processing page {ii + 1} with LLM...")
                 corrected_extracted_text_string = process_text_with_llm(extracted_text_string, check_if_valid_english, reformat_as_markdown)
-                print(f"Corrected text from page {ii + 1}:")
-                print(corrected_extracted_text_string)
-                print('_'*80)
                 list_of_corrected_text_strings.append(corrected_extracted_text_string)
         # join the list of strings into a single string with a newline after each page
         final_text = "\n".join(list_of_corrected_text_strings)
-        # get the base name of the input file (without the extension)
-        base_name = os.path.splitext(input_pdf_file_path)[0]
-        # choose the extension based on the reformat_as_markdown flag
-        output_extension = '.md' if reformat_as_markdown else '.txt'
-        # create the output file path
-        output_file_path = base_name + output_extension
-        # write the final text to the output file
-        with open(output_file_path, 'w') as f:
-            f.write(final_text)
-        print(f"LLM corrected text written to: {output_file_path}")
-    
+ 
     if test_filtering_hallucinations: #For debugging
         base_name = os.path.splitext(input_pdf_file_path)[0]
         output_extension = '.md' if reformat_as_markdown else '.txt'    
@@ -232,9 +215,43 @@ if __name__ == '__main__':
     print('Now filtering out hallucinations from corrected text...')
     filtered_output, original_embeddings, corrected_embeddings = filter_hallucinations(final_text, raw_ocr_output, starting_hallucination_similarity_threshold, input_pdf_file_path, sentence_embeddings_db_path)
     print('Done filtering out hallucinations.')
+
+
+    return raw_ocr_output, final_text, filtered_output
+
+
+if __name__ == '__main__':
+    input_pdf_file_path = '160301289-Warren-Buffett-Katharine-Graham-Letter.pdf'
+    max_test_pages = 2 # set to 0 to convert all pages of the PDF file using Tesseract
+    skip_first_n_pages = 0 # set to 0 to process all pages with the LLM
+    starting_hallucination_similarity_threshold = 0.30 # The higher you set this, the more potential hallucinations will be filtered out (but also the more potential correct sentences will be filtered out)
+    check_if_valid_english = False # set to True to check if the extracted text is valid English
+    reformat_as_markdown = True # set to True to reformat the corrected extracted text using markdown formatting
+    sentence_embeddings_db_path = "./sentence_embeddings.sqlite"
+    test_filtering_hallucinations = False # set to True to test filtering hallucinations (for debugging purposes)
+
+    raw_ocr_output, final_text, filtered_output=  tesseract_with_llm_correction(input_pdf_file_path, 
+                                  max_test_pages, 
+                                  skip_first_n_pages, 
+                                  starting_hallucination_similarity_threshold, 
+                                  check_if_valid_english, reformat_as_markdown, 
+                                  sentence_embeddings_db_path, 
+                                  test_filtering_hallucinations)
+    
+    base_name = os.path.splitext(input_pdf_file_path)[0]
+    
+    raw_ocr_output_file_path = f"{base_name}__raw_ocr_output.txt"
+    with open(raw_ocr_output_file_path, "w") as f:
+        f.write(raw_ocr_output)
+
+    output_extension = '.md' if reformat_as_markdown else '.txt'
+    # create the output file path
+    output_file_path = base_name + output_extension
+    
+    print(f"LLM corrected text written to: {output_file_path}")
+    with open(output_file_path, 'w') as f:
+            f.write(final_text)
+
     final_output_file_path = base_name + '_filtered' + output_extension
     with open(final_output_file_path, 'w') as f:
         f.write(filtered_output)
-    print(f"Filtered text written to: {final_output_file_path}")
-    print(f"Done processing {input_pdf_file_path}. \n\nSee output files:\n Raw OCR: {raw_ocr_output_file_path} \n LLM Corrected: {output_file_path} \n LLM Corrected with Hallucinations Filtered: {final_output_file_path}\n")
-    
