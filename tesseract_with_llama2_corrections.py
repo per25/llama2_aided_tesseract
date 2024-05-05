@@ -1,18 +1,13 @@
 from pdf2image import convert_from_path
 import pytesseract
-from llama_cpp import Llama
+from openai import OpenAI
 from multiprocessing import Pool
-from langchain.embeddings import LlamaCppEmbeddings
-from sklearn.metrics.pairwise import cosine_similarity
-from tqdm import tqdm
 import os
 import pickle
 import hashlib
 import sqlite3
-
-# sudo apt-get install -y tesseract-ocr libtesseract-dev poppler-utils
-# git lfs install
-# git clone https://huggingface.co/TheBloke/Llama-2-13B-chat-GGML
+import numpy as np
+from os import getenv
 
 def convert_pdf_to_images_func(input_pdf_file_path, max_test_pages):
     if max_test_pages == 0:
@@ -46,138 +41,147 @@ def remove_intro(llm_output_2_text):
     except Exception as e:
         print(f"Exception in remove_intro: {e}")
         return llm_output_2_text
-    
-def is_valid_english(llm_output_1_text):
-    # Use the lower() function to make the string comparison case-insensitive.
-    # Use the strip() function to remove any leading or trailing white space.
-    # Then check if the string starts with 'yes'.
-    return llm_output_1_text.lower().strip().startswith('yes')
 
-def process_text_with_llm_func(extracted_text_string, check_if_valid_english=False, reformat_as_markdown=True):
-    max_tokens = 2*len(extracted_text_string) + 50
-    prompt_text_1 = f"Q: Is this valid English text? (y/n): ```{extracted_text_string}``` A: _|_"
-    prompt_text_2 = f"Q: Correct any typos caused by bad OCR in this text, using common sense reasoning, responding only with the corrected text: ```{extracted_text_string}``` A: _|_"
+def process_text_with_llm(extracted_text_string, check_if_valid_english=False, reformat_as_markdown=True):
+    client = OpenAI(base_url="https://openrouter.ai/api/v1",
+                    api_key=getenv("OPENROUTER_API_KEY"))
+    model = "meta-llama/llama-3-70b-instruct"
+    messages = [{"role": "system", "content": "You are an intelligent text processing assistant."}]
+    
+    # Check if the text is valid English
     if check_if_valid_english:
-        llm_output_1 = llm(prompt_text_1, max_tokens=max_tokens, stop=["Q:", "_|_"], echo=True)
-        llm_output_1_text = llm_output_1["choices"][0]["text"].replace(prompt_text_1, "")
-        valid_english = is_valid_english(llm_output_1_text)
+        messages.append({"role": "user", "content": f"Is this valid English text? (y/n): ```{extracted_text_string}```"})
+        response = client.chat.completions.create(model=model, messages=messages)
+        valid_english = response.choices[0].message.content.strip().lower() == 'y'
     else:
         valid_english = False
-    if valid_english or not check_if_valid_english:
-        llm_output_2 = llm(prompt_text_2, max_tokens=max_tokens, stop=["Q:", "_|_"], echo=True)
-        llm_output_2_text = llm_output_2["choices"][0]["text"].replace(prompt_text_2, "")
-        corrected_extracted_text_string = remove_intro(llm_output_2_text)
-    if reformat_as_markdown:
-        prompt_test_3 = f"Q: Reformat this text to be more readable using markdown formatting and using common sense reasoning; respond only with the reformatted text: ```{corrected_extracted_text_string}``` A: _|_"    
-        llm_output_3 = llm(corrected_extracted_text_string, max_tokens=max_tokens, stop=["Q:", "_|_"], echo=True)
-        corrected_extracted_text_string = llm_output_3["choices"][0]["text"].replace(prompt_test_3, "")
-    return corrected_extracted_text_string
 
-def calculate_sentence_embedding(llama, text):
+    # Correct any typos
+    corrected_text = extracted_text_string
+    if valid_english or not check_if_valid_english:
+        messages.append({"role": "user", "content": f"Correct any typos in this text, using common sense reasoning and only respond with the corrected text : ```{extracted_text_string}```"})
+        response = client.chat.completions.create(model=model, messages=messages)
+        corrected_text = response.choices[0].message.content
+
+    # Reformat using markdown
+    if reformat_as_markdown:
+        messages.append({"role": "user", "content": f"Reformat this text to be more readable using markdown formatting and only respond with the markdown content: ```{corrected_text}```"})
+        response = client.chat.completions.create(model=model, messages=messages)
+        corrected_text = response.choices[0].message.content
+
+    return corrected_text
+
+def calculate_sentence_embedding_2(text):
+    client = OpenAI(base_url="https://openrouter.ai/api/v1",
+                    api_key=getenv("OPENROUTER_API_KEY"))
+    model = "text-embedding-ada-002"
     sentence_embedding = None
     while sentence_embedding is None:
         try:
-            sentence_embedding = llama.embed_query(text)
+            # Use the text-embedding-ada-002 model to compute embeddings
+            response = client.Embeddings.create(
+                model=model,
+                input=text
+            )
+            sentence_embedding = response['data'][0]['embedding']
         except Exception as e:
-            #If the sentence is too long, resulting in the error "llama_tokenize_with_model: too many tokens", then trim the sentence and try again
             print(f"Exception in calculate_sentence_embedding: {e}")
-            text = text[:int(len(text)*0.95)]
-            print(f"Trimming sentence due to too many tokens. New length: {len(text)}")
+            # Trimming the sentence if it's too long
+            if "too many tokens" in str(e):
+                text = text[:int(len(text) * 0.95)]
+                print(f"Trimming sentence due to too many tokens. New length: {len(text)}")
+            else:
+                break
     return sentence_embedding
 
-def calculate_similarity(args):
-    corrected_embedding, original_embedding = args
-    return cosine_similarity([corrected_embedding], [original_embedding])
+def cosine_similarity(vec1, vec2):
+    return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
 
 def filter_hallucinations(corrected_text, raw_text, threshold=0.1, pdf_file_path=None, db_path=None):
+    client = OpenAI(base_url="https://openrouter.ai/api/v1",
+                    api_key=getenv("OPENROUTER_API_KEY"))
     threshold_increment = 0.02
+    original_embeddings, corrected_embeddings = None, None
+
     if db_path is not None and pdf_file_path is not None:
-        # Check if the database file exists
+        # Check if the database file exists and compute hash of the pdf file
         if not os.path.isfile(db_path):
             print(f"No existing database found at {db_path}. Creating a new one.")
-        # Compute hash of the pdf file
-        sha3_256 = hashlib.sha3_256()
         with open(pdf_file_path, "rb") as f:
+            sha3_256 = hashlib.sha3_256()
             for byte_block in iter(lambda: f.read(4096), b""):
                 sha3_256.update(byte_block)
         file_hash = sha3_256.hexdigest()
-        # Connect to the database
         conn = sqlite3.connect(db_path)
         c = conn.cursor()
-        # Create table if not exists
         c.execute('''CREATE TABLE IF NOT EXISTS embeddings
                      (file_hash text PRIMARY KEY, original_embeddings blob, corrected_embeddings blob)''')
-        # Try to fetch embeddings from the database
         c.execute("SELECT * FROM embeddings WHERE file_hash=?", (file_hash,))
         row = c.fetchone()
-        if row is not None:
+        if row:
             original_embeddings = pickle.loads(row[1])
             corrected_embeddings = pickle.loads(row[2])
-        else:
-            original_embeddings = None
-            corrected_embeddings = None
-    else:
-        original_embeddings = None
-        corrected_embeddings = None
-    llama = LlamaCppEmbeddings(model_path=model_file_path)
-    original_sentences = [s for s in raw_text.split('. ')]
-    if original_embeddings is None:
-        print("Calculating embeddings for original sentences...")
-        original_embeddings = {s: calculate_sentence_embedding(llama, s) for s in tqdm(original_sentences)}
-    corrected_sentences = [s for s in corrected_text.split('. ')]
-    if corrected_embeddings is None:
-        print("Calculating embeddings for corrected sentences...")
-        corrected_embeddings = {s: calculate_sentence_embedding(llama, s) for s in tqdm(corrected_sentences)}
+
+    def calculate_and_store_embeddings(sentences, embeddings):
+        if embeddings is None:
+            embeddings = {}
+            for sentence in sentences:
+                response = client.embeddings.create(model="text-embedding-ada-002", input=[sentence])
+                embeddings[sentence] = response.data[0].embedding
+        return embeddings
+
+    original_sentences = [s.strip() for s in raw_text.split('. ') if s.strip()]
+    corrected_sentences = [s.strip() for s in corrected_text.split('. ') if s.strip()]
+    
+    original_embeddings = calculate_and_store_embeddings(original_sentences, original_embeddings)
+    corrected_embeddings = calculate_and_store_embeddings(corrected_sentences, corrected_embeddings)
+
     # Save the embeddings to the database
     if db_path is not None and pdf_file_path is not None:
         c.execute("INSERT OR REPLACE INTO embeddings VALUES (?, ?, ?)",
                   (file_hash, pickle.dumps(original_embeddings), pickle.dumps(corrected_embeddings)))
         conn.commit()
+
     original_length = len(raw_text)
     filtered_corrected_text = corrected_text
     last_threshold = threshold
     last_filtered_text = filtered_corrected_text
+
     while True:
         filtered_sentences = []
-        print(f"Filtering sentences with threshold {threshold}...")
-        for corrected_sentence in tqdm(corrected_sentences):
+        for corrected_sentence in corrected_sentences:
             corrected_embedding = corrected_embeddings.get(corrected_sentence)
-            if corrected_embedding is None:  # Check for None embeddings
-                print(f"Could not get embedding for sentence: {corrected_sentence}")
-                continue  # skip this sentence or handle this case differently
-            similarities = [cosine_similarity([corrected_embedding], [original_embedding]) for original_sentence, original_embedding in original_embeddings.items()]
+            if corrected_embedding is None:
+                continue
+            similarities = [cosine_similarity(corrected_embedding, original_embeddings.get(original_sentence, [0]*512)) for original_sentence in original_sentences]
             max_similarity = max(similarities) if similarities else 0
             if max_similarity >= threshold:
                 filtered_sentences.append(corrected_sentence)
+
         filtered_corrected_text = ". ".join(filtered_sentences)
-        print(f"Filtered text length: {len(filtered_corrected_text)}; original text length: {original_length}; difference (est. hallucinated text length): {len(filtered_corrected_text) - original_length}; Current threshold: {threshold}")        
         if len(filtered_corrected_text) < original_length - 30:
-            filtered_corrected_text = last_filtered_text  # Use the filtered text from the previous iteration
-            threshold = last_threshold  # Use the threshold from the previous iteration
+            filtered_corrected_text = last_filtered_text
+            threshold = last_threshold
             break
         else:
-            last_threshold = threshold  # Store the current threshold before incrementing it
-            last_filtered_text = filtered_corrected_text  # Store the current filtered text before moving on to the next iteration
-            threshold += threshold_increment  # Increment the threshold if the condition is not met
-    print(f"Selected threshold: {threshold}")
-    return filtered_corrected_text, original_embeddings, corrected_embeddings
+            last_threshold = threshold
+            last_filtered_text = filtered_corrected_text
+            threshold += threshold_increment
 
+    return filtered_corrected_text, original_embeddings, corrected_embeddings
 
 if __name__ == '__main__':
     input_pdf_file_path = '160301289-Warren-Buffett-Katharine-Graham-Letter.pdf'
     max_test_pages = 0 # set to 0 to convert all pages of the PDF file using Tesseract
     skip_first_n_pages = 0 # set to 0 to process all pages with the LLM
-    starting_hallucination_similarity_threshold = 0.40 # The higher you set this, the more potential hallucinations will be filtered out (but also the more potential correct sentences will be filtered out)
+    starting_hallucination_similarity_threshold = 0.30 # The higher you set this, the more potential hallucinations will be filtered out (but also the more potential correct sentences will be filtered out)
     check_if_valid_english = False # set to True to check if the extracted text is valid English
     reformat_as_markdown = True # set to True to reformat the corrected extracted text using markdown formatting
-    model_file_path = "./Llama-2-13B-chat-GGML/llama-2-13b-chat.ggmlv3.q5_K_S.bin"
     sentence_embeddings_db_path = "./sentence_embeddings.sqlite"
     test_filtering_hallucinations = False # set to True to test filtering hallucinations (for debugging purposes)
 
     if not test_filtering_hallucinations:
         list_of_scanned_images = convert_pdf_to_images_func(input_pdf_file_path, max_test_pages)
-        print(f"Loading Llama model from {model_file_path}...")
-        llm = Llama(model_path=model_file_path, n_ctx=2048)
         print(f"Tesseract version: {pytesseract.get_tesseract_version()}")
         print("Extracting text from converted pages...")
         with Pool() as p:
@@ -196,7 +200,7 @@ if __name__ == '__main__':
             extracted_text_string = check_extracted_pages_func(text)
             if extracted_text_string:
                 print(f"Processing page {ii + 1} with LLM...")
-                corrected_extracted_text_string = process_text_with_llm_func(extracted_text_string, check_if_valid_english, reformat_as_markdown)
+                corrected_extracted_text_string = process_text_with_llm(extracted_text_string, check_if_valid_english, reformat_as_markdown)
                 print(f"Corrected text from page {ii + 1}:")
                 print(corrected_extracted_text_string)
                 print('_'*80)
