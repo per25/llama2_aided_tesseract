@@ -1,13 +1,14 @@
 from pdf2image import convert_from_path
 import pytesseract
 from openai import OpenAI
-from multiprocessing import Pool
+from concurrent.futures import ThreadPoolExecutor
 import os
 import pickle
 import hashlib
 import sqlite3
 import numpy as np
 from os import getenv
+
 
 def convert_pdf_to_images_func(input_pdf_file_path, max_test_pages):
     if max_test_pages == 0:
@@ -182,11 +183,9 @@ def tesseract_with_llm_correction(input_pdf_file_path,
         print(f"Tesseract version: {pytesseract.get_tesseract_version()}")
         print("Extracting text from converted pages...")
         
-        with Pool() as p:
-            list_of_extracted_text_strings = p.map(ocr_image, list_of_scanned_images)
-        print("Done extracting text from converted pages. \n")
+        with ThreadPoolExecutor() as executor:
+            list_of_extracted_text_strings = list(executor.map(ocr_image, list_of_scanned_images))
         raw_ocr_output = "\n".join(list_of_extracted_text_strings)
-        base_name = os.path.splitext(input_pdf_file_path)[0]
 
         # process the OCR output
         list_of_corrected_text_strings = []
