@@ -183,20 +183,25 @@ def tesseract_with_llm_correction(input_pdf_file_path,
         print(f"Tesseract version: {pytesseract.get_tesseract_version()}")
         print("Extracting text from converted pages...")
         
+
+        def process_text(ii_text_tuple):
+            ii, text = ii_text_tuple
+            if ii < skip_first_n_pages:
+                return None
+            extracted_text_string = check_extracted_pages_func(text)
+            if extracted_text_string:
+                print(f"Processing page {ii + 1} with LLM...")
+                corrected_extracted_text_string = process_text_with_llm(extracted_text_string, check_if_valid_english, reformat_as_markdown)
+                return corrected_extracted_text_string
+            return None
+
         with ThreadPoolExecutor() as executor:
             list_of_extracted_text_strings = list(executor.map(ocr_image, list_of_scanned_images))
         raw_ocr_output = "\n".join(list_of_extracted_text_strings)
 
         # process the OCR output
-        list_of_corrected_text_strings = []
-        for ii, text in enumerate(list_of_extracted_text_strings):
-            if ii < skip_first_n_pages:
-                continue
-            extracted_text_string = check_extracted_pages_func(text)
-            if extracted_text_string:
-                print(f"Processing page {ii + 1} with LLM...")
-                corrected_extracted_text_string = process_text_with_llm(extracted_text_string, check_if_valid_english, reformat_as_markdown)
-                list_of_corrected_text_strings.append(corrected_extracted_text_string)
+        with ThreadPoolExecutor() as executor:
+            list_of_corrected_text_strings = list(filter(None, executor.map(process_text, enumerate(list_of_extracted_text_strings))))
         # join the list of strings into a single string with a newline after each page
         final_text = "\n".join(list_of_corrected_text_strings)
  
