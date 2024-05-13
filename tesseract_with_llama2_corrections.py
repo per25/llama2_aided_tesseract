@@ -8,6 +8,8 @@ import hashlib
 import sqlite3
 import numpy as np
 from os import getenv
+import time
+import psutil
 
 
 def convert_pdf_to_images_func(input_pdf_file_path, max_test_pages):
@@ -48,11 +50,14 @@ def process_text_with_llm(extracted_text_string, check_if_valid_english=False, r
                     api_key=getenv("OPENROUTER_API_KEY"))
     model = "meta-llama/llama-3-70b-instruct"
     messages = [{"role": "system", "content": "You are an intelligent text processing assistant."}]
+
+    llm_tokens = 0
     
     # Check if the text is valid English
     if check_if_valid_english:
         messages.append({"role": "user", "content": f"Is this valid English text? (y/n): ```{extracted_text_string}```"})
         response = client.chat.completions.create(model=model, messages=messages)
+        llm_tokens += response.usage.total_tokens
         valid_english = response.choices[0].message.content.strip().lower() == 'y'
     else:
         valid_english = False
@@ -62,15 +67,17 @@ def process_text_with_llm(extracted_text_string, check_if_valid_english=False, r
     if valid_english or not check_if_valid_english:
         messages.append({"role": "user", "content": f"Correct any typos in this text, using common sense reasoning and only respond with the corrected text : ```{extracted_text_string}```"})
         response = client.chat.completions.create(model=model, messages=messages)
+        llm_tokens += response.usage.total_tokens
         corrected_text = response.choices[0].message.content
 
     # Reformat using markdown
     if reformat_as_markdown:
         messages.append({"role": "user", "content": f"Reformat this text to be more readable using markdown formatting and only respond with the markdown content: ```{corrected_text}```"})
         response = client.chat.completions.create(model=model, messages=messages)
+        llm_tokens += response.usage.total_tokens
         corrected_text = response.choices[0].message.content
 
-    return corrected_text
+    return corrected_text, llm_tokens
 
 def calculate_sentence_embedding_2(text):
     client = OpenAI(base_url="https://openrouter.ai/api/v1",
@@ -102,6 +109,7 @@ def filter_hallucinations(corrected_text, raw_text, threshold=0.1, pdf_file_path
     client = OpenAI()
     threshold_increment = 0.02
     original_embeddings, corrected_embeddings = None, None
+    total_tokens = 0
 
     if db_path is not None and pdf_file_path is not None:
         # Check if the database file exists and compute hash of the pdf file
@@ -123,18 +131,22 @@ def filter_hallucinations(corrected_text, raw_text, threshold=0.1, pdf_file_path
             corrected_embeddings = pickle.loads(row[2])
 
     def calculate_and_store_embeddings(sentences, embeddings):
+        tokens = 0
         if embeddings is None:
             embeddings = {}
             for sentence in sentences:
                 response = client.embeddings.create(model="text-embedding-ada-002", input=[sentence])
+                tokens += response.usage.total_tokens
                 embeddings[sentence] = response.data[0].embedding
-        return embeddings
+        return embeddings, tokens
 
     original_sentences = [s.strip() for s in raw_text.split('. ') if s.strip()]
     corrected_sentences = [s.strip() for s in corrected_text.split('. ') if s.strip()]
     
-    original_embeddings = calculate_and_store_embeddings(original_sentences, original_embeddings)
-    corrected_embeddings = calculate_and_store_embeddings(corrected_sentences, corrected_embeddings)
+    original_embeddings, tokens = calculate_and_store_embeddings(original_sentences, original_embeddings)
+    total_tokens += tokens
+    corrected_embeddings, tokens = calculate_and_store_embeddings(corrected_sentences, corrected_embeddings)
+    total_tokens += tokens
 
     # Save the embeddings to the database
     if db_path is not None and pdf_file_path is not None:
@@ -168,7 +180,7 @@ def filter_hallucinations(corrected_text, raw_text, threshold=0.1, pdf_file_path
             last_filtered_text = filtered_corrected_text
             threshold += threshold_increment
 
-    return filtered_corrected_text, original_embeddings, corrected_embeddings
+    return filtered_corrected_text, original_embeddings, corrected_embeddings, total_tokens
 
 def tesseract_with_llm_correction(input_pdf_file_path, 
                                   max_test_pages=0,
@@ -183,6 +195,20 @@ def tesseract_with_llm_correction(input_pdf_file_path,
         print(f"Tesseract version: {pytesseract.get_tesseract_version()}")
         print("Extracting text from converted pages...")
         
+        performance_metrics = [
+            {
+            'Execution Time (seconds)': 0,
+            'CPU Usage (percent)': 0,
+            'Memory Usage (MB)': 0,
+            'llm_tokens': 0,
+            'embedding_tokens': 0,
+            'pages_calls': 0
+            } for _ in range(3)
+        ]
+        
+        start_time = time.time()
+        start_cpu = psutil.cpu_percent(interval=None)
+        start_memory = psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2
 
         def process_text(ii_text_tuple):
             ii, text = ii_text_tuple
@@ -191,19 +217,50 @@ def tesseract_with_llm_correction(input_pdf_file_path,
             extracted_text_string = check_extracted_pages_func(text)
             if extracted_text_string:
                 print(f"Processing page {ii + 1} with LLM...")
-                corrected_extracted_text_string = process_text_with_llm(extracted_text_string, check_if_valid_english, reformat_as_markdown)
-                return corrected_extracted_text_string
+                corrected_extracted_text_string, llm_tokens = process_text_with_llm(extracted_text_string, check_if_valid_english, reformat_as_markdown)
+                return corrected_extracted_text_string, llm_tokens
             return None
 
         with ThreadPoolExecutor() as executor:
             list_of_extracted_text_strings = list(executor.map(ocr_image, list_of_scanned_images))
         raw_ocr_output = "\n".join(list_of_extracted_text_strings)
+        
+        end_time = time.time()
+        end_cpu = psutil.cpu_percent(interval=None)
+        end_memory = psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2
+
+        performance_metrics[0]['Execution Time (seconds)'] = end_time - start_time
+        performance_metrics[0]['CPU Usage (percent)'] = end_cpu - start_cpu
+        performance_metrics[0]['Memory Usage (MB)'] = end_memory - start_memory
+        performance_metrics[0]['llm_tokens'] = 0
+        performance_metrics[0]['embedding_tokens'] = 0
+        performance_metrics[0]['pages_calls'] = 0
+
+        start_time = time.time()
+        start_cpu = psutil.cpu_percent(interval=None)
+        start_memory = psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2
 
         # process the OCR output
         with ThreadPoolExecutor() as executor:
-            list_of_corrected_text_strings = list(filter(None, executor.map(process_text, enumerate(list_of_extracted_text_strings))))
+            results = list(filter(None, executor.map(process_text, enumerate(list_of_extracted_text_strings))))
+        # separate the corrected text strings and llm tokens
+        list_of_corrected_text_strings, llm_tokens_list = zip(*results)
         # join the list of strings into a single string with a newline after each page
         final_text = "\n".join(list_of_corrected_text_strings)
+        # sum up all the llm tokens
+        total_llm_tokens = sum(llm_tokens_list)
+
+        end_time = time.time()
+        end_cpu = psutil.cpu_percent(interval=None)
+        end_memory = psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2
+
+        performance_metrics[1]['Execution Time (seconds)'] = end_time - start_time + performance_metrics[0]['Execution Time (seconds)']
+        performance_metrics[1]['CPU Usage (percent)'] = end_cpu - start_cpu + performance_metrics[0]['CPU Usage (percent)']
+        performance_metrics[1]['Memory Usage (MB)'] = end_memory - start_memory + performance_metrics[0]['Memory Usage (MB)']
+        performance_metrics[1]['llm_tokens'] = total_llm_tokens + performance_metrics[0]['llm_tokens']
+        performance_metrics[1]['embedding_tokens'] = 0 + performance_metrics[0]['embedding_tokens']
+        performance_metrics[1]['pages_calls'] = 0 + performance_metrics[0]['pages_calls']
+
  
     if test_filtering_hallucinations: #For debugging
         base_name = os.path.splitext(input_pdf_file_path)[0]
@@ -217,11 +274,27 @@ def tesseract_with_llm_correction(input_pdf_file_path,
             raw_ocr_output = f.read()
     
     print('Now filtering out hallucinations from corrected text...')
-    filtered_output, original_embeddings, corrected_embeddings = filter_hallucinations(final_text, raw_ocr_output, starting_hallucination_similarity_threshold, input_pdf_file_path, sentence_embeddings_db_path)
+    
+    start_time = time.time()
+    start_cpu = psutil.cpu_percent(interval=None)
+    start_memory = psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2
+
+    filtered_output, original_embeddings, corrected_embeddings, embedding_tokens = filter_hallucinations(final_text, raw_ocr_output, starting_hallucination_similarity_threshold, input_pdf_file_path, sentence_embeddings_db_path)
+    
+    end_time = time.time()
+    end_cpu = psutil.cpu_percent(interval=None)
+    end_memory = psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2
+
+    performance_metrics[2]['Execution Time (seconds)'] = end_time - start_time + performance_metrics[1]['Execution Time (seconds)']
+    performance_metrics[2]['CPU Usage (percent)'] = end_cpu - start_cpu + performance_metrics[1]['CPU Usage (percent)']
+    performance_metrics[2]['Memory Usage (MB)'] = end_memory - start_memory + performance_metrics[1]['Memory Usage (MB)']
+    performance_metrics[2]['llm_tokens'] = 0 + performance_metrics[1]['llm_tokens']
+    performance_metrics[2]['embedding_tokens'] = embedding_tokens + performance_metrics[1]['embedding_tokens']
+    performance_metrics[2]['pages_calls'] = 0 + performance_metrics[1]['pages_calls']
+    
     print('Done filtering out hallucinations.')
 
-
-    return raw_ocr_output, final_text, filtered_output
+    return raw_ocr_output, final_text, filtered_output, performance_metrics
 
 
 if __name__ == '__main__':
@@ -234,7 +307,7 @@ if __name__ == '__main__':
     sentence_embeddings_db_path = "./sentence_embeddings.sqlite"
     test_filtering_hallucinations = False # set to True to test filtering hallucinations (for debugging purposes)
 
-    raw_ocr_output, final_text, filtered_output=  tesseract_with_llm_correction(input_pdf_file_path, 
+    raw_ocr_output, final_text, filtered_output, performance_metrics  =  tesseract_with_llm_correction(input_pdf_file_path, 
                                   max_test_pages, 
                                   skip_first_n_pages, 
                                   starting_hallucination_similarity_threshold, 
@@ -242,6 +315,12 @@ if __name__ == '__main__':
                                   sentence_embeddings_db_path, 
                                   test_filtering_hallucinations)
     
+    print("Performance Metrics:")
+    for i, metrics in enumerate(performance_metrics):
+        print(f"Page {i + 1}:")
+        for key, value in metrics.items():
+            print(f"{key}: {value}")
+
     base_name = os.path.splitext(input_pdf_file_path)[0]
     
     raw_ocr_output_file_path = f"{base_name}__raw_ocr_output.txt"
